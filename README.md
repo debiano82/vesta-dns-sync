@@ -48,13 +48,14 @@ The MX points to a host **inside the customer's domain** (`mail.<domain>`) rathe
 - `bash` 4+, `dig` (`dnsutils` / `bind9-dnsutils`), `openssl`
 - Run as **root** (to read the DKIM private key and, with `--regen`, use the panel CLI)
 - The server hostname (`hostname -f`) must resolve publicly: its A/AAAA records are used to determine the IPs (or set `IP4` / `IP6` manually)
+- `ip` (iproute2), optional: when available, the IPs obtained from DNS must match a public address configured on the server's interfaces, otherwise the script stops. This protects against a tampered DNS answer being published as the domain's A/AAAA. Servers behind NAT (only private addresses on the interfaces) skip the check.
 
 ---
 
 ## Installation
 
 ```bash
-curl -O https://github.com/debiano82/vesta-dns-sync/blob/main/hosting-dns.sh
+curl -O https://raw.githubusercontent.com/debiano82/vesta-dns-sync/main/hosting-dns.sh
 install -m 700 hosting-dns.sh /root/hosting-dns.sh
 ```
 
@@ -63,7 +64,7 @@ install -m 700 hosting-dns.sh /root/hosting-dns.sh
 ## Usage
 
 ```
-hosting-dns.sh <domain> [--mx <sub>] [--no-mx] [--regen [bits]]
+hosting-dns.sh <domain> [--mx <sub>] [--no-mx] [--regen [bits]] [--yes]
 ```
 
 | Option          | Description |
@@ -71,7 +72,8 @@ hosting-dns.sh <domain> [--mx <sub>] [--no-mx] [--regen [bits]]
 | `<domain>`      | Domain to process (required). |
 | `--mx <sub>`    | Subdomain used as mail host. Default: `mail` → `mail.<domain>`. |
 | `--no-mx`       | Incoming mail is handled elsewhere (Google Workspace, Microsoft 365, another server). Skips MX, `mail`, `webmail` and SRV records; SPF authorizes only this server's IPs for outgoing mail. |
-| `--regen [bits]`| Regenerates the domain's DKIM key through the panel CLI (`v-delete-mail-domain-dkim` + `v-add-mail-domain-dkim`) before generating records. Default 2048 bits. **The old key stops working immediately**: publish the new record right away. |
+| `--regen [bits]`| Regenerates the domain's DKIM key through the panel CLI (`v-delete-mail-domain-dkim` + `v-add-mail-domain-dkim`) before generating records. Default 2048 bits. **The old key stops working immediately**: publish the new record right away. Asks for confirmation on a terminal and saves the old key in `ZONE_DIR` (mode 600) before deleting it. |
+| `--yes`         | Skip the `--regen` confirmation (required when stdin is not a terminal). |
 
 ### Examples
 
@@ -111,14 +113,14 @@ ZONE_DIR=. ./hosting-dns.sh example.com
 | `DMARC_RUA`    | `postmaster@<domain>`   | Address receiving DMARC aggregate reports. |
 | `CAA_CA`       | `letsencrypt.org`       | Certificate authority allowed by the CAA record. |
 | `TTL`          | `300`                   | TTL written in the zone file. |
-| `ZONE_DIR`     | `/root/dns-zones`       | Where the zone file is saved. |
+| `ZONE_DIR`     | `/root/dns-zones`       | Where the zone file is saved. Created with mode 700; symlinks are refused. |
 
 ---
 
 ## Output
 
 ```
-================ example.com  (NS: hydrogen.ns.hetzner.com.) ================
+================ example.com  (NS: hydrogen.ns.hetzner.com.; DNSSEC: zona non firmata, controllo non autenticato) ================
 TIPO   NOME                 VALORE
 A      @                    203.0.113.10
                          -> OK
@@ -144,10 +146,10 @@ File zona importabile su Hetzner: /root/dns-zones/example.com.zone
 | `DIVERSO -> <value>`            | Different from expected; the current value is shown. |
 | `N RECORD -> lasciane uno`      | N records found where only one is allowed (e.g. two SPF or two DKIM records): delete the extras. |
 | `DIVERSO dalla chiave di Exim`  | The published DKIM key does not match the private key Exim signs with: **DKIM will fail**. |
-| `(rimuovi s=mail)`              | The DKIM record contains `s=mail`, which is invalid (`s=` is the service type and accepts only `email` or `*`): remove it. |
+| `CHIAVE OK (rimuovi s=mail)`    | The DKIM key matches but the record contains `s=mail`, which is invalid (`s=` is the service type and accepts only `email` or `*`): remove it. Counted as a record to fix. |
 | `(posta in arrivo oggi li')`    | The current MX points elsewhere: changing it will redirect incoming mail to this server. |
 
-For `www`, `ftp`, `mail` and `webmail` the check resolves the name (following CNAMEs) and verifies it ends on the server IP, so an equivalent A record instead of a CNAME is also reported as `OK`.
+For `www`, `ftp`, `mail` and `webmail` the check resolves the name (following CNAMEs) and verifies it ends on the server IP, so an equivalent A record instead of a CNAME is also reported as `OK`. If the name resolves to other or additional addresses, they are listed after `DIVERSO`.
 
 The PTR check verifies that the reverse DNS of the server IPv4 matches `hostname -f`. The PTR is set at the IP owner (your hosting/VPS provider's panel), not in the domain zone.
 
@@ -193,9 +195,11 @@ _dmarc                   300 IN TXT   "v=DMARC1; p=quarantine; rua=mailto:postma
 ## Notes and caveats
 
 - **DKIM and 255-char strings.** A 2048-bit key produces a TXT value of ~400 characters. DNS strings are limited to 255 characters, so the script splits the value into quoted chunks (`"..." "..."`). Resolvers concatenate them transparently. Hetzner does not split long values automatically.
-- **Don't regenerate keys from the panel and from the script at random.** Each regeneration creates a new key; only the one in `/etc/exim4/domains/<domain>/dkim.pem` is used for signing. Always publish what the script prints.
+- **Don't regenerate keys from the panel and from the script at random.** Each regeneration creates a new key; only the one in `/etc/exim4/domains/<domain>/dkim.pem` is used for signing. Always publish what the script prints. To roll back, copy the saved `<domain>.dkim.pem.<timestamp>` from `ZONE_DIR` over `dkim.pem` and restart Exim.
 - **External senders.** If the domain also sends through other services (Google Workspace, Microsoft 365, newsletters, CRMs), add their `include:` mechanisms to SPF manually; the script will then report SPF as `DIVERSO`, which is expected.
+- **CAA locks certificate issuance.** The default `0 issue "letsencrypt.org"` means **only** Let's Encrypt can issue certificates for the domain. If the panel (or acme.sh) falls back to ZeroSSL, or the customer buys a certificate elsewhere, issuance fails with a CAA error. Set `CAA_CA` accordingly or add further `issue` records by hand.
 - **DMARC policy.** `quarantine` is a sensible default once SPF and DKIM pass. For a domain with unknown senders start with `DMARC_POLICY=none` and read the reports.
+- **Trust in DNS answers.** Queries to `PUB_DNS` and to the authoritative nameserver travel in clear UDP and are not validated. The header shows `DNSSEC: validata` when the resolver sets the AD flag for the zone (signed and valid); otherwise every `OK` is only as good as the path to those servers. The server's own IPs are cross-checked against the local interfaces (see Requirements).
 - **Local zones.** If myVesta still has a local DNS zone for a domain whose DNS is external, delete it (`v-delete-dns-domain <user> <domain>`) or stop BIND if unused, to avoid inconsistencies.
 - **Changing the MX moves incoming mail.** If the domain's mailboxes live elsewhere, use `--no-mx`.
 
